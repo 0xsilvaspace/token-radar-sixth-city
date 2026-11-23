@@ -21,8 +21,21 @@
 
 <section class="card model">
   <h2>How the ranking works</h2>
-  <p>Each protocol's implied value starts from its TVL with diminishing returns, so the board is not just TVL order: size is TVL to the power 0.9. That size is priced by its category's market-cap-to-TVL ratio, the median of the protocols in that category that already have a token (categories with fewer than 3 fall back to the global median, 0.21). Then four multipliers from the snapshot's own figures: the protocol's 7-day TVL change (clamped to -20% to +50%, weight 0.75), its category's momentum, the median 7-day change of that category's token protocols (clamped to -15% to +30%, weight 0.5), how long it has run with no token (log-scaled, 0.70 to 1.00 over 4 years), and how many chains it runs on (up to 1.15 for six or more). No protocol name is special-cased: the same formula scores every row, and every detail view shows the factor-by-factor working. Implied values are this entry's own claim, not a prediction that a token will be issued or what it will be worth. A protocol is shown as one that <strong>records no token</strong> in the snapshot, never as one that has none.</p>
+  <p id="model-text">Each protocol's implied value starts from its TVL with diminishing returns, so the board is not just TVL order: size is TVL to the power 0.9. That size is priced by its category's market-cap-to-TVL ratio, the median of the protocols in that category that already have a token (categories with fewer than 3 fall back to the global median, 0.21). Then four multipliers from the snapshot's own figures: the protocol's 7-day TVL change (clamped to -20% to +50%, weight 0.75), its category's momentum, the median 7-day change of that category's token protocols (clamped to -15% to +30%, weight 0.5), how long it has run with no token (log-scaled, 0.70 to 1.00 over 4 years), and how many chains it runs on (up to 1.15 for six or more). No protocol name is special-cased: the same formula scores every row, and every detail view shows the factor-by-factor working. Implied values are this entry's own claim, not a prediction that a token will be issued or what it will be worth. A protocol is shown as one that <strong>records no token</strong> in the snapshot, never as one that has none.</p>
+  <p class="fine" id="regression-line"></p>
   <p class="fine" id="model-line"></p>
+</section>
+
+<section class="card movers">
+  <h2>Top movers</h2>
+  <p class="fine">The ten pre-token protocols on the board with the strongest 7-day TVL growth. A fast grower is not automatically the most valuable launch: growth is one multiplier in the model, and the board ranks on implied value, not on this list.</p>
+  <ol id="movers"></ol>
+</section>
+
+<section class="card cats">
+  <h2>Implied value by category</h2>
+  <p class="fine">Total implied value of the board's rows in each category, in dollars. Risk Curators and Onchain Capital Allocators dominate because the largest pre-token protocols sit in them.</p>
+  <div id="catchart" role="img" aria-label="Bar chart of total implied value by category"></div>
 </section>
 
 <section class="card controls">

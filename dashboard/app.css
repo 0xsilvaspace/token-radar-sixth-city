@@ -96,6 +96,13 @@ td.rank { font-weight: 700; color: #14532d; font-size: 16px; }
 .detail li { margin-bottom: 9px; }
 .detail li b { color: #14532d; }
 .detail .close { float: right; border: 1px solid #b9bfb6; background: #fff; border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; }
+.movers ol { margin: 8px 0 0; padding-left: 22px; }
+.movers li { margin-bottom: 7px; cursor: pointer; }
+.movers li:hover { color: #14532d; }
+.cats svg { display: block; margin-top: 10px; }
+.chart-label { font-size: 12px; fill: #4c554e; font-family: inherit; }
+.chart-value { font-size: 12px; fill: #1d211d; font-weight: 600; font-family: inherit; }
+.chart-bar { fill: #14532d; }
 .hidden { display: none; }
 footer { padding: 4px 24px 24px; }
 @media (max-width: 760px) {

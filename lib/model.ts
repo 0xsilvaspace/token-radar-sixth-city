@@ -1,4 +1,4 @@
-// Token launch radar, model version radar-3.
+// Token launch radar, model version radar-4.
 //
 // One sealed snapshot in, one ranked board out. The board ranks protocols that
 // record no token (no market cap, no CoinGecko id, no symbol) by an implied
@@ -6,7 +6,21 @@
 // The value is the entry's own claim, never make.fun's, and it never predicts
 // whether or when a token is issued.
 //
-// The model, per protocol. Every input comes from the snapshot alone; no
+// radar-4 fits its value model to the snapshot instead of hand-picking the
+// weights: at runtime it runs an ordinary least squares regression of log
+// market cap on log TVL, 7-day growth, age and chain count, over the token
+// protocols the snapshot holds, with plain standard-library math. The fit is
+// then judged on its own numbers before it is allowed to score anything:
+// it must explain at least 30% of the variation (R-squared 0.30 or better)
+// and its TVL, growth and age coefficients must all be non-negative, since a
+// launch is worth more when the protocol is bigger, growing and long-running.
+// On this snapshot the fit fails that bar: it explains only about 22% of log
+// market cap, and its growth and age coefficients come out negative, the
+// opposite of what a launch is worth (a single down week in the snapshot, and
+// older token protocols carrying lower market caps). So radar-4 scores with
+// the radar-3 category-median model and reports the regression, its
+// coefficients and its R-squared, as a diagnostic the dashboard shows. The
+// scoring model, per protocol, every input from the snapshot alone; no
 // protocol name is ever special-cased and the same functions score every row.
 //
 //   sizeValue  = TVL with diminishing returns: TVL^0.9 * $1M^0.1. A $2.75B
@@ -100,7 +114,10 @@ export const MODEL: ModelConstants = {
   implied_cap_usd: 50_000_000_000,
 };
 
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
+
+/** The bar a fitted regression must clear before it is allowed to score. */
+export const FIT_MIN_R_SQUARED = 0.3;
 
 /** How many rows the board holds: the whole watchlist plus the best early rows. */
 export const BOARD_ROWS = 250;
@@ -130,6 +147,8 @@ export interface BoardRow {
     maturity_multiplier: number;
     chain_factor: number;
     age_years: number;
+    /** What the fitted regression alone would price this protocol at, a diagnostic, never the score. */
+    regression_value_usd: number;
   };
   farm_steps: string[];
 }
@@ -146,12 +165,49 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
+/** One of the board's fastest growers over seven days. */
+export interface MoverRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  change_7d: number;
+  tvl_usd: number;
+  implied_value_usd: number;
+  rank: number;
+}
+
+/**
+ * The regression radar-4 fits at runtime: log market cap on log TVL, 7-day
+ * growth, age and chain count, over the snapshot's token protocols. The fit
+ * is reported whole, whether or not it is used to score, so the choice of
+ * scoring model is checkable from the dashboard's own data.
+ */
+export interface RegressionFit {
+  /** Token protocols the fit ran on. */
+  n: number;
+  /** Share of log market cap's variation the fit explains. */
+  r_squared: number;
+  /** Fitted coefficients, in the order [intercept, log TVL, growth, log(1+age), log chains]. */
+  coefficients: [number, number, number, number, number];
+  /** Median 7-day change of the token protocols, used where a protocol reports none. */
+  median_growth_pct: number;
+  /** Median age in years of the token protocols, used where a protocol reports no listed date. */
+  median_age_years: number;
+  /** Whether the fit cleared the bar to score the board. */
+  usable: boolean;
+  /** Why the fit was or was not used, in plain words. */
+  reason: string;
+}
+
 export interface RadarData {
   as_of: string;
   source: string;
   floor_usd: number;
   model: ModelConstants;
   model_version: string;
+  /** Which model scored the board, and why. */
+  scoring: string;
+  regression: RegressionFit;
   watchlist_size: number;
   board_size: number;
   early_size: number;
@@ -160,6 +216,8 @@ export interface RadarData {
   category_momentum: Record<string, number>;
   rows: RadarRow[];
   live: LiveRow[];
+  /** The board's ten fastest growers over seven days. */
+  movers: MoverRow[];
 }
 
 export class SnapshotError extends Error {
@@ -188,6 +246,161 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   const b = Date.parse(`${listedAt}T00:00:00Z`);
   if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
   return Math.max(0, Math.floor((a - b) / DAY_MS));
+}
+
+/** Solve a small linear system by Gaussian elimination with partial pivoting, or null when it is singular. */
+export function solveLinear(a: number[][], b: number[]): number[] | null {
+  const k = b.length;
+  const m = a.map((row, i) => [...row, b[i]!]);
+  for (let col = 0; col < k; col++) {
+    let piv = col;
+    for (let r = col + 1; r < k; r++) if (Math.abs(m[r]![col]!) > Math.abs(m[piv]![col]!)) piv = r;
+    if (piv !== col) {
+      const tmp = m[col]!;
+      m[col] = m[piv]!;
+      m[piv] = tmp;
+    }
+    const d = m[col]![col]!;
+    if (Math.abs(d) < 1e-10) return null;
+    for (let r = col + 1; r < k; r++) {
+      const f = m[r]![col]! / d;
+      for (let c = col; c <= k; c++) m[r]![c]! -= f * m[col]![c]!;
+    }
+  }
+  const x = Array<number>(k).fill(0);
+  for (let r = k - 1; r >= 0; r--) {
+    let s = m[r]![k]!;
+    for (let c = r + 1; c < k; c++) s -= m[r]![c]! * x[c]!;
+    x[r] = s / m[r]![r]!;
+  }
+  return x;
+}
+
+/** Ordinary least squares on a small design matrix, or null when it is singular. */
+export function ols(xRows: number[][], y: number[]): number[] | null {
+  const k = xRows[0]!.length;
+  const ata: number[][] = Array.from({ length: k }, () => Array<number>(k).fill(0));
+  const aty: number[] = Array<number>(k).fill(0);
+  for (let i = 0; i < xRows.length; i++) {
+    for (let r = 0; r < k; r++) {
+      aty[r]! += xRows[i]![r]! * y[i]!;
+      for (let c = 0; c < k; c++) ata[r]![c]! += xRows[i]![r]! * xRows[i]![c]!;
+    }
+  }
+  return solveLinear(ata, aty);
+}
+
+/**
+ * The regression's one row of inputs for a protocol: [1, log TVL, growth,
+ * log(1+age), log chains]. Growth is clamped to -50% to +100%; a missing
+ * 7-day change takes the token protocols' median, a missing listed date
+ * their median age. The same transform is used to fit and to predict, so
+ * the fit's R-squared describes the predictions it makes.
+ */
+export function regressionRow(p: SnapshotProtocol, asOf: string, medianGrowthPct: number, medianAgeYears: number): [number, number, number, number, number] {
+  const growth = (typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : medianGrowthPct) / 100;
+  const age = ageDays(asOf, p.listed_at);
+  const ageYears = age === null ? medianAgeYears : age / 365;
+  return [
+    1,
+    Math.log(Math.max(1, p.tvl_usd)),
+    Math.min(1.0, Math.max(-0.5, growth)),
+    Math.log(1 + ageYears),
+    Math.log(Math.max(1, p.chains.length)),
+  ];
+}
+
+/**
+ * Fit log market cap on log TVL, 7-day growth, age and chain count, over the
+ * snapshot's token protocols, and judge the fit on its own numbers. The fit
+ * is usable only when it explains at least FIT_MIN_R_SQUARED of the
+ * variation and its TVL, growth and age coefficients are all non-negative:
+ * a launch is worth more when the protocol is bigger, growing and
+ * long-running, and a fit that says otherwise is fitting one week's noise.
+ * On this snapshot the fit explains only about a fifth of log market cap
+ * and its growth and age coefficients are negative, so it is reported and
+ * not used: the board scores with the category-median model instead.
+ */
+export function fitRegression(snapshot: Snapshot): RegressionFit {
+  const token = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const growths = token.filter((p) => typeof p.change_7d === 'number').map((p) => p.change_7d as number);
+  const ages = token.map((p) => ageDays(snapshot.as_of, p.listed_at)).filter((a): a is number => a !== null).map((a) => a / 365);
+  const medianGrowthPct = median(growths) ?? 0;
+  const medianAgeYears = median(ages) ?? 1;
+  const xRows: number[][] = [];
+  const y: number[] = [];
+  for (const p of token) {
+    xRows.push(regressionRow(p, snapshot.as_of, medianGrowthPct, medianAgeYears));
+    y.push(Math.log(p.mcap_usd as number));
+  }
+  const beta = xRows.length > 5 ? ols(xRows, y) : null;
+  if (beta === null || beta.length !== 5) {
+    return {
+      n: token.length,
+      r_squared: 0,
+      coefficients: [0, 0, 0, 0, 0],
+      median_growth_pct: Math.round(medianGrowthPct * 100) / 100,
+      median_age_years: Math.round(medianAgeYears * 100) / 100,
+      usable: false,
+      reason: 'The regression could not be fitted (singular design matrix), so the board scores with the category-median model.',
+    };
+  }
+  const yMean = y.reduce((a, v) => a + v, 0) / y.length;
+  let ssRes = 0;
+  let ssTot = 0;
+  for (let i = 0; i < y.length; i++) {
+    const pred = xRows[i]!.reduce((a, v, j) => a + v * beta[j]!, 0);
+    ssRes += (y[i]! - pred) ** 2;
+    ssTot += (y[i]! - yMean) ** 2;
+  }
+  const rSquared = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+  const [, bTvl, bGrowth, bAge] = beta as [number, number, number, number, number];
+  const usable = rSquared >= FIT_MIN_R_SQUARED && bTvl > 0 && bGrowth >= 0 && bAge >= 0;
+  const reason = usable
+    ? `The fitted regression explains ${(rSquared * 100).toFixed(1)}% of log market cap across ${token.length} token protocols, so it scores the board.`
+    : `The fitted regression explains only ${(rSquared * 100).toFixed(1)}% of log market cap across ${token.length} token protocols, and its growth (${bGrowth.toFixed(2)}) and age (${bAge.toFixed(2)}) coefficients are negative, the opposite of what a launch is worth, so the board scores with the category-median model and the regression stands as a diagnostic.`;
+  return {
+    n: token.length,
+    r_squared: Math.round(rSquared * 10000) / 10000,
+    coefficients: beta.map((v) => Math.round(v * 10000) / 10000) as [number, number, number, number, number],
+    median_growth_pct: Math.round(medianGrowthPct * 100) / 100,
+    median_age_years: Math.round(medianAgeYears * 100) / 100,
+    usable,
+    reason,
+  };
+}
+
+/**
+ * Each category's calibration for the regression: the median of (log market
+ * cap minus the regression's prediction) over that category's token
+ * protocols, shrunk toward zero as n/(n+3), so a category with few samples
+ * barely moves the prediction. Categories with fewer than 3 token protocols
+ * get no calibration. Only used when the fit is usable.
+ */
+export function categoryResiduals(snapshot: Snapshot, fit: RegressionFit): Record<string, number> {
+  const byCategory = new Map<string, number[]>();
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    const row = regressionRow(p, snapshot.as_of, fit.median_growth_pct, fit.median_age_years);
+    const pred = row.reduce((a, v, j) => a + v * fit.coefficients[j]!, 0);
+    const key = p.category ?? 'Uncategorised';
+    const list = byCategory.get(key) ?? [];
+    list.push(Math.log(p.mcap_usd) - pred);
+    byCategory.set(key, list);
+  }
+  const out: Record<string, number> = {};
+  for (const [cat, list] of byCategory) {
+    out[cat] = list.length >= 3 ? Math.round(((median(list) ?? 0) * list.length) / (list.length + 3) * 10000) / 10000 : 0;
+  }
+  return out;
+}
+
+/** What the fitted regression alone would price a protocol at, a diagnostic. */
+export function regressionValue(p: SnapshotProtocol, asOf: string, fit: RegressionFit, residuals: Record<string, number>, model: ModelConstants = MODEL): number {
+  const row = regressionRow(p, asOf, fit.median_growth_pct, fit.median_age_years);
+  let logValue = row.reduce((a, v, j) => a + v * fit.coefficients[j]!, 0);
+  logValue += residuals[p.category ?? 'Uncategorised'] ?? 0;
+  return Math.min(model.implied_cap_usd, Math.max(1, Math.round(Math.exp(logValue))));
 }
 
 /** Whether a protocol records no token at all in the snapshot. */
@@ -302,6 +515,48 @@ export function impliedValue(
   return { implied, ratio, size, growthPct, growthMult, momentumPct, momentumMult, maturityMult, chainFactor, ageYears, age };
 }
 
+/**
+ * The fitted regression's scoring of one protocol, written in the same
+ * factor form as impliedValue so the two models compare directly: the
+ * regression's log-linear terms become multipliers that multiply to the
+ * regression's prediction. Only used when the fit clears its bar.
+ */
+export function regressionBreakdown(
+  p: SnapshotProtocol,
+  asOf: string,
+  fit: RegressionFit,
+  residuals: Record<string, number>,
+  model: ModelConstants = MODEL,
+): {
+  implied: number;
+  ratio: number;
+  size: number;
+  growthPct: number;
+  growthMult: number;
+  momentumPct: number;
+  momentumMult: number;
+  maturityMult: number;
+  chainFactor: number;
+  ageYears: number;
+  age: number | null;
+} {
+  const [intercept, bTvl, bGrowth, bAge, bChains] = fit.coefficients;
+  const row = regressionRow(p, asOf, fit.median_growth_pct, fit.median_age_years);
+  const age = ageDays(asOf, p.listed_at);
+  const ageYears = age === null ? fit.median_age_years : age / 365;
+  const size = Math.exp(intercept + bTvl * row[1]);
+  const ratio = Math.exp(residuals[p.category ?? 'Uncategorised'] ?? 0);
+  const growthPct = Math.round(row[2] * 100 * 100) / 100;
+  const growthMult = Math.exp(bGrowth * row[2]);
+  const maturityMult = Math.exp(bAge * row[3]);
+  const chainFactor = Math.exp(bChains * row[4]);
+  const implied = Math.min(
+    model.implied_cap_usd,
+    Math.max(1, Math.round(size * ratio * growthMult * maturityMult * chainFactor)),
+  );
+  return { implied, ratio, size, growthPct, growthMult, momentumPct: 0, momentumMult: 1, maturityMult, chainFactor, ageYears, age };
+}
+
 /** A deterministic pick from a list, keyed by a string, so runs agree byte for byte. */
 function pick<T>(list: readonly T[], key: string): T {
   let h = 2166136261;
@@ -344,6 +599,32 @@ function capitalFor(p: SnapshotProtocol): number {
   if (p.tvl_usd >= 250_000_000) return 150;
   if (p.tvl_usd >= 50_000_000) return 100;
   return 50;
+}
+
+/**
+ * The capital a farm should start with, from the primary chain's gas: on
+ * cheap chains a small position is fine, where Ethereum gas dominates the
+ * position must be a few hundred dollars or the fees eat it. The range
+ * always contains the position size, so the plan never contradicts itself.
+ */
+function capitalRange(p: SnapshotProtocol): string {
+  const gas = p.chains.length > 0 ? gasFor(p.chains[0]!) : 1;
+  const capital = capitalFor(p);
+  let low: number;
+  let high: number;
+  if (gas >= 2) {
+    low = 200;
+    high = 500;
+  } else if (gas < 0.1) {
+    low = 25;
+    high = 100;
+  } else {
+    low = 50;
+    high = 200;
+  }
+  low = Math.min(low, capital);
+  high = Math.max(high, capital);
+  return `$${low} to $${high}`;
 }
 
 /** How long to hold, from the protocol's age: younger protocols need longer. */
@@ -580,12 +861,12 @@ const WEEKLY: Record<string, readonly string[]> = {
   ],
 };
 
-/** The setup step, naming the chain's fee asset. */
+/** The setup step, naming the chain's fee asset and the capital range. */
 const SETUP: readonly string[] = [
-  'Open a fresh wallet that holds only the funds you plan to farm, fund it with the {CAP} plus about {GAS} of {ASSET} for fees on {CHAIN}, and keep its seed phrase offline.',
-  'Set up a separate wallet for this farm alone, fund it with {CAP} and a little {ASSET} for {CHAIN} fees, and store the seed phrase off the computer.',
-  'Use a dedicated wallet for {NAME}, fund it with exactly {CAP} plus {GAS} of {ASSET} to pay {CHAIN} gas, and keep the seed phrase offline.',
-  'Create a new wallet for this farm, move {CAP} into it with enough of {ASSET} to cover a few {CHAIN} transactions, and write the seed phrase down on paper.',
+  'Open a fresh wallet that holds only the funds you plan to farm, fund it with {MINCAP} of capital and put {CAP} in the position, plus about {GAS} of {ASSET} for fees on {CHAIN}, and keep its seed phrase offline.',
+  'Set up a separate wallet for this farm alone, fund it with {MINCAP} of capital, put {CAP} in the first position and a little {ASSET} aside for {CHAIN} fees, and store the seed phrase off the computer.',
+  'Use a dedicated wallet for {NAME}, fund it with {MINCAP} of capital, place {CAP} in the position with {GAS} of {ASSET} to pay {CHAIN} gas, and keep the seed phrase offline.',
+  'Create a new wallet for this farm, move {MINCAP} of capital into it, put {CAP} in the position with enough of {ASSET} to cover a few {CHAIN} transactions, and write the seed phrase down on paper.',
 ];
 
 /** The exit step: claim only through the official app, then unwind. */
@@ -594,6 +875,65 @@ const EXIT: readonly string[] = [
   'Before you withdraw, open the protocol’s own points or rewards page, claim only from the link it publishes, and exit the position the same way you entered it.',
   'Check the protocol’s own rewards page before you move funds, claim only through its official app, and never pay anyone to claim for you.',
 ];
+
+/**
+ * The one risk that matters most for a group, in the protocol's own terms:
+ * what can actually go wrong with this kind of farm, not a generic warning.
+ */
+const RISK: Record<string, readonly string[]> = {
+  lend: [
+    'Biggest risk: smart-contract risk in the lending pool, a bug could freeze the funds you supplied, so never farm with money you cannot afford to lose.',
+    'Biggest risk: a lending pool exploit could lock supplied funds for months, so keep the position small and in one wallet.',
+  ],
+  yield: [
+    'Biggest risk: impermanent loss in the pool plus points dilution if too many farmers join the same pool.',
+    'Biggest risk: the pool can lose value against the assets you supplied, and the points can be diluted as more farmers arrive.',
+  ],
+  bridge: [
+    'Biggest risk: a bridge exploit could strand the funds mid-transfer, so only move amounts you can afford to have delayed.',
+    'Biggest risk: the bridge can pause withdrawals after an exploit, so keep each transfer small.',
+  ],
+  stake: [
+    'Biggest risk: slashing or an unstaking lock can keep funds tied up for weeks after you want them back.',
+    'Biggest risk: the stake can be locked through an unbonding period, so do not stake funds you may need soon.',
+  ],
+  trade: [
+    'Biggest risk: liquidation, a sharp move can wipe a leveraged position in minutes, so keep size small and stops set.',
+    'Biggest risk: leverage cuts both ways, so never risk more than 5% of the position on one trade.',
+  ],
+  vault: [
+    'Biggest risk: strategy risk, the vault can change strategy and underperform, so check the strategy page each week.',
+    'Biggest risk: the vault strategy can be changed by its managers, so read the strategy before you deposit.',
+  ],
+  rwa: [
+    'Biggest risk: issuer and counterparty risk, the tokenised asset depends on the issuer staying solvent.',
+    'Biggest risk: the issuer behind the asset could fail, so check who holds the reserves before you mint.',
+  ],
+  stable: [
+    'Biggest risk: depeg risk, the stable asset can slip below its peg and stay there for days.',
+    'Biggest risk: the peg can break in a market panic, so never hold more of the stable asset than you need.',
+  ],
+  predict: [
+    'Biggest risk: resolution risk, a market can settle on an outcome you did not expect.',
+    'Biggest risk: the market can resolve against you on a technicality, so only bet on outcomes you can verify.',
+  ],
+  insure: [
+    'Biggest risk: claim risk, a claim can be denied if the policy terms are not met.',
+    'Biggest risk: the policy may not pay out if the loss falls outside its terms, so read them before you buy.',
+  ],
+  pay: [
+    'Biggest risk: counterparty risk on the payment route, a failed payment can take days to reverse.',
+    'Biggest risk: the payment can fail mid-route, so keep each payment small and keep the receipts.',
+  ],
+  chain: [
+    'Biggest risk: smart-contract risk across several apps at once, one bad app can put the whole wallet at risk.',
+    'Biggest risk: using many apps multiplies the smart-contract risk, so keep the farm in one dedicated wallet.',
+  ],
+  deposit: [
+    'Biggest risk: smart-contract risk plus points dilution as more farmers join the same programme.',
+    'Biggest risk: the points can be diluted and the contract can be exploited, so keep the position modest.',
+  ],
+};
 
 /**
  * A protocol's farm plan: five steps, six when it runs on more than one
@@ -614,6 +954,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
   const sub = (s: string): string =>
     s
       .replaceAll('{CAP}', `$${capital}`)
+      .replaceAll('{MINCAP}', capitalRange(p))
       .replaceAll('{NAME}', p.name)
       .replaceAll('{CHAIN}', chain)
       .replaceAll('{GAS}', gas)
@@ -622,7 +963,8 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
   const action = sub(pick(ACTIONS[group] ?? ACTIONS.deposit!, `${p.slug}:action`));
   const eligible = sub(pick(ELIGIBLE[group] ?? ELIGIBLE.deposit!, `${p.slug}:eligible`));
   const weekly = sub(pick(WEEKLY[group] ?? WEEKLY.deposit!, `${p.slug}:weekly`));
-  const exit = sub(pick(EXIT, `${p.slug}:exit`));
+  const risk = sub(pick(RISK[group] ?? RISK.deposit!, `${p.slug}:risk`));
+  const exit = `${sub(pick(EXIT, `${p.slug}:exit`))} ${risk}`;
   const steps: { text: string; cost: string; time: string }[] = [
     { text: setup, cost: `about ${gas} of gas on ${chain}`, time: '10 minutes' },
     { text: action, cost: `$${capital} of capital and about ${gas} of gas`, time: '15 minutes to set up' },
@@ -670,9 +1012,28 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 }
 
 /** The ranked board: the whole watchlist, plus the best early rows, to BOARD_ROWS. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; ratios: Record<string, number>; momentum: Record<string, number> } {
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
+  board: BoardRow[];
+  ratios: Record<string, number>;
+  momentum: Record<string, number>;
+  fit: RegressionFit;
+  scoring: string;
+} {
   const ratios = categoryRatios(snapshot, model);
   const momentum = categoryMomentum(snapshot, model);
+  const fit = fitRegression(snapshot);
+  const residuals = categoryResiduals(snapshot, fit);
+  const scoring = fit.usable
+    ? `radar-4 regression: log market cap fitted at runtime on ${fit.n} token protocols (R² ${fit.r_squared}), scoring the board`
+    : `radar-3 category-median: the runtime regression explained only ${(fit.r_squared * 100).toFixed(1)}% of log market cap (R² ${fit.r_squared} on ${fit.n} token protocols), so it stands as a diagnostic and the category-median model scores`;
+  // The scorer: the fitted regression when it cleared its bar, else the
+  // category-median model. On this snapshot the fit fails its bar, so the
+  // board scores with radar-3 and every row still carries the regression's
+  // own prediction as a diagnostic.
+  const score = (p: SnapshotProtocol) =>
+    fit.usable
+      ? regressionBreakdown(p, snapshot.as_of, fit, residuals, model)
+      : impliedValue(p, snapshot.as_of, ratios, momentum, model);
   const bySlug = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const chosen = new Map<string, SnapshotProtocol>();
   for (const slug of snapshot.watchlist) {
@@ -685,14 +1046,15 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
   // snapshot, but their token already trades, so they are not launches.
   const early = snapshot.protocols
     .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
-    .map((p) => ({ p, value: impliedValue(p, snapshot.as_of, ratios, momentum, model).implied }))
+    .map((p) => ({ p, value: score(p).implied }))
     .sort((a, b) => b.value - a.value || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : 1))
     .slice(0, BOARD_ROWS - chosen.size);
   for (const e of early) chosen.set(e.p.slug, e.p);
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, ratios, momentum, model);
-    return { p, v };
+    const v = score(p);
+    const reg = regressionValue(p, snapshot.as_of, fit, residuals, model);
+    return { p, v, reg };
   });
   scored.sort(
     (a, b) =>
@@ -722,15 +1084,33 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
       maturity_multiplier: Math.round(s.v.maturityMult * 10000) / 10000,
       chain_factor: Math.round(s.v.chainFactor * 10000) / 10000,
       age_years: Math.round(s.v.ageYears * 100) / 100,
+      regression_value_usd: s.reg,
     },
     farm_steps: farmSteps(s.p, s.v.age),
   }));
-  return { board, ratios, momentum };
+  return { board, ratios, momentum, fit, scoring };
+}
+
+/** The board's ten fastest growers over seven days, for the dashboard's Top movers. */
+export function topMovers(board: BoardRow[]): MoverRow[] {
+  return board
+    .filter((r) => typeof r.change_7d === 'number' && Number.isFinite(r.change_7d))
+    .sort((a, b) => (b.change_7d as number) - (a.change_7d as number) || b.tvl_usd - a.tvl_usd)
+    .slice(0, 10)
+    .map((r) => ({
+      slug: r.slug,
+      name: r.name,
+      category: r.category,
+      change_7d: r.change_7d as number,
+      tvl_usd: r.tvl_usd,
+      implied_value_usd: r.implied_value_usd,
+      rank: r.rank,
+    }));
 }
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const { board, ratios, momentum } = buildBoard(snapshot, model);
+  const { board, ratios, momentum, fit, scoring } = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
@@ -739,6 +1119,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
+    scoring,
+    regression: fit,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
@@ -747,6 +1129,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     category_momentum: momentum,
     rows: board,
     live,
+    movers: topMovers(board),
   };
   return { board, radar };
 }

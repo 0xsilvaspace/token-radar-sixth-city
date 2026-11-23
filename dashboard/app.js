@@ -1,6 +1,7 @@
-// Token Launch Radar dashboard, model radar-3: renders window.RADAR with no network.
-// Sorting, filters, watchlist-only toggle, value bars, and a detail view for
-// every protocol with the model's factor-by-factor working. Deep links:
+// Token Launch Radar dashboard, model radar-4: renders window.RADAR with no network.
+// Sorting, filters, watchlist-only toggle, value bars, top movers, a category
+// chart, and a detail view for every protocol with the model's factor-by-factor
+// working and the regression's own price as a check. Deep links:
 // #detail=<slug> opens a protocol, #cat=<category> filters by category.
 
 (function () {
@@ -49,6 +50,49 @@
     '<div><span>Watchlist TVL</span><strong>' + money(R.rows.filter(function (r) { return r.on_watchlist; }).reduce(function (a, r) { return a + r.tvl_usd; }, 0)) + '</strong></div>';
   $('model-line').textContent = 'Model ' + R.model_version + ': size is TVL^0.9, priced by the category median market-cap/TVL ratio (clamped 0.01–1.5), then growth ×0.75, category momentum ×0.5, log-scaled maturity 0.70–1.00 over 4 years, and a chain factor up to 1.15. Ratios and momentum are medians of the token protocols in each category, falling back to the global median.';
   $('board-note').textContent = 'Ranks are by implied value, highest first. The bar under each value is its share of rank 1. The Live token view shows the market’s own values, never a model’s.';
+
+  // The regression radar-4 fits at runtime, shown with its own verdict.
+  (function () {
+    var f = R.regression, c = f.coefficients;
+    function term(v, label) {
+      var sign = v < 0 ? '− ' : '+ ';
+      return sign + Math.abs(v).toFixed(2) + '·' + label;
+    }
+    $('regression-line').textContent = 'Fitted, not hand-picked: at runtime the program regresses log market cap on log TVL, 7-day growth, age and chain count across the ' + f.n +
+      ' token protocols: log market cap = ' + c[0].toFixed(2) + ' ' + term(c[1], 'log TVL') + ' ' + term(c[2], 'growth') + ' ' + term(c[3], 'log(1+age)') + ' ' + term(c[4], 'log chains') +
+      ', R² ' + f.r_squared.toFixed(2) + '. ' + f.reason + ' ' + R.scoring + '.';
+  })();
+
+  // Top movers: the board's ten fastest growers over seven days.
+  $('movers').innerHTML = R.movers.map(function (m) {
+    return '<li data-slug="' + esc(m.slug) + '"><strong>#' + m.rank + ' ' + esc(m.name) + '</strong> <span class="up">' + pct(m.change_7d) + '</span> in 7 days · TVL ' + money(m.tvl_usd) + ' · implied ' + money(m.implied_value_usd) + '</li>';
+  }).join('');
+  $('movers').addEventListener('click', function (e) {
+    var li = e.target.closest('li[data-slug]');
+    if (!li) return;
+    location.hash = 'detail=' + li.getAttribute('data-slug');
+    showDetail(li.getAttribute('data-slug'));
+  });
+
+  // Total implied value by category, as a small inline SVG bar chart.
+  (function () {
+    var totals = {};
+    R.rows.forEach(function (r) {
+      var c = r.category || 'Uncategorised';
+      totals[c] = (totals[c] || 0) + r.implied_value_usd;
+    });
+    var top = Object.keys(totals).map(function (c) { return { c: c, v: totals[c] }; })
+      .sort(function (a, b) { return b.v - a.v; }).slice(0, 8);
+    var max = top.length ? top[0].v : 1, W = 640, rowH = 28, H = top.length * rowH + 8;
+    var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img" aria-label="Implied value by category">';
+    top.forEach(function (t, i) {
+      var y = 8 + i * rowH, w = Math.max(4, Math.round((t.v / max) * 380));
+      svg += '<text x="0" y="' + (y + 15) + '" class="chart-label">' + esc(t.c.length > 26 ? t.c.slice(0, 25) + '…' : t.c) + '</text>' +
+        '<rect x="210" y="' + y + '" width="' + w + '" height="16" rx="3" class="chart-bar"/>' +
+        '<text x="' + (216 + w) + '" y="' + (y + 14) + '" class="chart-value">' + money(t.v) + '</text>';
+    });
+    $('catchart').innerHTML = svg + '</svg>';
+  })();
 
   // Fill the filter dropdowns from the data.
   var cats = {}, chains = {};
@@ -139,6 +183,7 @@
       '<tr><td>Chain factor (' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's') + ')</td><td>× ' + m.chain_factor + '</td></tr>' +
       '<tr><td><strong>Implied value</strong></td><td><strong>' + money(r.implied_value_usd) + '</strong></td></tr>' +
       '</tbody></table>' +
+      '<p class="fine">Regression check: the fitted model would price this protocol at ' + money(m.regression_value_usd) + '. The fit is a diagnostic, not the score: it explains only ' + (R.regression.r_squared * 100).toFixed(1) + '% of log market cap, so the board scores with the category-median model above.</p>' +
       '<p class="fine">This protocol records no token in the snapshot. The implied value is this entry’s own claim, not a prediction that a token will be issued.</p>' +
       '<h3>How to farm it</h3><ol>' + steps + '</ol>';
     detailEl.classList.remove('hidden');
