@@ -17,9 +17,11 @@
   <div class="meta" id="meta"></div>
 </header>
 
+<section class="stats" id="stats" aria-label="Board summary"></section>
+
 <section class="card model">
   <h2>How the ranking works</h2>
-  <p>Each protocol's implied value is TVL times its category's market-cap-to-TVL ratio, where the ratio is the median of the protocols in that category that already have a token. The result is adjusted by the protocol's 7-day TVL change (clamped to -20% to +50%) and by how long it has run with no token (up to 3 years). No protocol name is special-cased: the same formula scores every row. Implied values are this entry's own claim, not a prediction that a token will be issued or what it will be worth. A protocol is shown as one that <strong>records no token</strong> in the snapshot, never as one that has none.</p>
+  <p>Each protocol's implied value starts from its TVL with diminishing returns, so the board is not just TVL order: size is TVL to the power 0.9. That size is priced by its category's market-cap-to-TVL ratio, the median of the protocols in that category that already have a token (categories with fewer than 3 fall back to the global median, 0.21). Then four multipliers from the snapshot's own figures: the protocol's 7-day TVL change (clamped to -20% to +50%, weight 0.75), its category's momentum, the median 7-day change of that category's token protocols (clamped to -15% to +30%, weight 0.5), how long it has run with no token (log-scaled, 0.70 to 1.00 over 4 years), and how many chains it runs on (up to 1.15 for six or more). No protocol name is special-cased: the same formula scores every row, and every detail view shows the factor-by-factor working. Implied values are this entry's own claim, not a prediction that a token will be issued or what it will be worth. A protocol is shown as one that <strong>records no token</strong> in the snapshot, never as one that has none.</p>
   <p class="fine" id="model-line"></p>
 </section>
 
@@ -29,13 +31,14 @@
   <label>Chain <select id="chain"><option value="">All chains</option></select></label>
   <label>View <select id="view"><option value="board">Pre-token board</option><option value="live">Live tokens</option></select></label>
   <label>Sort <select id="sort"><option value="rank">Rank</option><option value="value">Implied value</option><option value="tvl">TVL</option><option value="growth">7-day change</option></select></label>
+  <label class="check"><input id="watchonly" type="checkbox"> Watchlist only</label>
   <span class="count" id="count"></span>
 </section>
 
 <main>
   <section class="card detail hidden" id="detail" aria-live="polite"></section>
 
-  <section class="card">
+  <section class="card board-card">
     <table id="board">
       <thead>
         <tr>

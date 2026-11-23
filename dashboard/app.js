@@ -1,5 +1,6 @@
-// Token Launch Radar dashboard: renders window.RADAR with no network.
-// Sorting, filters and a detail view for every protocol. Deep links:
+// Token Launch Radar dashboard, model radar-3: renders window.RADAR with no network.
+// Sorting, filters, watchlist-only toggle, value bars, and a detail view for
+// every protocol with the model's factor-by-factor working. Deep links:
 // #detail=<slug> opens a protocol, #cat=<category> filters by category.
 
 (function () {
@@ -8,8 +9,9 @@
 
   var $ = function (id) { return document.getElementById(id); };
   var rowsEl = $('rows'), detailEl = $('detail'), countEl = $('count');
-  var qEl = $('q'), catEl = $('cat'), chainEl = $('chain'), viewEl = $('view'), sortEl = $('sort');
-  var state = { q: '', cat: '', chain: '', view: 'board', sort: 'rank', selected: null };
+  var qEl = $('q'), catEl = $('cat'), chainEl = $('chain'), viewEl = $('view'), sortEl = $('sort'), watchEl = $('watchonly');
+  var state = { q: '', cat: '', chain: '', view: 'board', sort: 'rank', watchOnly: false, selected: null };
+  var topValue = R.rows.length ? R.rows[0].implied_value_usd : 1;
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -30,11 +32,23 @@
     return n == null ? '' : n >= 0 ? 'up' : 'down';
   }
 
-  // Header figures.
+  // Header figures and the summary strip.
   $('meta').innerHTML = '<strong>' + R.board_size + ' rows</strong>' +
     R.watchlist_size + ' on the watchlist · ' + R.early_size + ' early finds · snapshot ' + esc(R.as_of);
-  $('model-line').textContent = 'Model ' + R.model_version + ': category median market-cap/TVL ratio, 7-day growth clamped to -20% to +50%, maturity 0.6 to 1.0 over 3 years without a token. Ratios are medians of the token protocols in each category, clamped to 0.01–1.5.';
-  $('board-note').textContent = 'Ranks are by implied value, highest first. The Live token view shows the market’s own values, never a model’s.';
+  var totalValue = 0, topCat = '', topCatValue = 0, catTotals = {};
+  R.rows.forEach(function (r) {
+    totalValue += r.implied_value_usd;
+    var c = r.category || 'Uncategorised';
+    catTotals[c] = (catTotals[c] || 0) + r.implied_value_usd;
+    if (catTotals[c] > topCatValue) { topCatValue = catTotals[c]; topCat = c; }
+  });
+  $('stats').innerHTML =
+    '<div><span>Board implied value</span><strong>' + money(totalValue) + '</strong></div>' +
+    '<div><span>Top protocol</span><strong>' + esc(R.rows.length ? R.rows[0].name : '—') + '</strong></div>' +
+    '<div><span>Top category</span><strong>' + esc(topCat) + '</strong></div>' +
+    '<div><span>Watchlist TVL</span><strong>' + money(R.rows.filter(function (r) { return r.on_watchlist; }).reduce(function (a, r) { return a + r.tvl_usd; }, 0)) + '</strong></div>';
+  $('model-line').textContent = 'Model ' + R.model_version + ': size is TVL^0.9, priced by the category median market-cap/TVL ratio (clamped 0.01–1.5), then growth ×0.75, category momentum ×0.5, log-scaled maturity 0.70–1.00 over 4 years, and a chain factor up to 1.15. Ratios and momentum are medians of the token protocols in each category, falling back to the global median.';
+  $('board-note').textContent = 'Ranks are by implied value, highest first. The bar under each value is its share of rank 1. The Live token view shows the market’s own values, never a model’s.';
 
   // Fill the filter dropdowns from the data.
   var cats = {}, chains = {};
@@ -49,7 +63,6 @@
     var o = document.createElement('option'); o.value = c; o.textContent = c; chainEl.appendChild(o);
   });
 
-  // Each board row carries on_watchlist, set by main.ts from the snapshot.
   function isWatch(r) { return !!r.on_watchlist; }
 
   function currentRows() {
@@ -59,6 +72,7 @@
       if (q && r.name.toLowerCase().indexOf(q) < 0 && r.slug.toLowerCase().indexOf(q) < 0) return false;
       if (state.cat && r.category !== state.cat) return false;
       if (state.chain && r.chains.indexOf(state.chain) < 0) return false;
+      if (state.watchOnly && state.view === 'board' && !isWatch(r)) return false;
       return true;
     });
   }
@@ -78,6 +92,7 @@
     var html = '';
     list.forEach(function (r) {
       var value = state.view === 'live' ? r.mcap_usd : r.implied_value_usd;
+      var bar = state.view === 'live' ? '' : '<div class="valbar"><i style="width:' + Math.max(2, Math.round(value / topValue * 100)) + '%"></i></div>';
       html += '<tr data-slug="' + esc(r.slug) + '"' + (state.selected === r.slug ? ' class="selected"' : '') + '>' +
         '<td class="rank num">' + (state.view === 'live' ? '—' : r.rank) + '</td>' +
         '<td><strong>' + esc(r.name) + '</strong>' + (isWatch(r) ? '<span class="badge">WATCHLIST</span>' : '') + '<br><span class="fine">' + esc(r.slug) + '</span></td>' +
@@ -85,7 +100,7 @@
         '<td>' + esc(r.chains.slice(0, 3).join(', ')) + (r.chains.length > 3 ? ' +' + (r.chains.length - 3) : '') + '</td>' +
         '<td class="num">' + money(r.tvl_usd) + '</td>' +
         '<td class="num ' + pctClass(r.change_7d) + '">' + pct(r.change_7d) + '</td>' +
-        '<td class="num"><strong>' + money(value) + '</strong></td></tr>';
+        '<td class="num valcell"><strong>' + money(value) + '</strong>' + bar + '</td></tr>';
     });
     rowsEl.innerHTML = html || '<tr><td colspan="7">No protocols match these filters.</td></tr>';
     countEl.textContent = list.length + ' of ' + (state.view === 'live' ? R.live_size : R.board_size) + ' shown';
@@ -97,7 +112,12 @@
     if (!r) { detailEl.classList.add('hidden'); state.selected = null; render(); return; }
     state.selected = slug;
     var m = r.model;
-    var steps = r.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('');
+    var steps = r.farm_steps.map(function (s, i) {
+      var cost = s.match(/Cost: (.*?)\. Time: (.*?)\.?$/);
+      var body = cost ? s.slice(0, cost.index).trim() : s;
+      var foot = cost ? '<br><span class="fine">Cost: ' + esc(cost[1]) + ' · Time: ' + esc(cost[2]) + '</span>' : '';
+      return '<li><b>Step ' + (i + 1) + '.</b> ' + esc(body) + foot + '</li>';
+    }).join('');
     detailEl.innerHTML = '<button class="close" id="close-detail">Close</button>' +
       '<h2>' + esc(r.name) + (isWatch(r) ? '<span class="badge">WATCHLIST</span>' : '') + '</h2>' +
       '<p class="fine">' + esc(r.slug) + ' · ' + esc(r.category || 'Uncategorised') + ' · ' + esc(r.chains.join(', ')) + '</p>' +
@@ -107,9 +127,20 @@
       '<div>7-day change<strong class="' + pctClass(r.change_7d) + '">' + pct(r.change_7d) + '</strong></div>' +
       '<div>Listed<strong>' + esc(r.listed_at || 'not recorded') + '</strong></div>' +
       '<div>Age<strong>' + (r.age_days == null ? 'not recorded' : r.age_days + ' days') + '</strong></div>' +
+      '<div>Chains<strong>' + r.chains.length + '</strong></div>' +
       '</div>' +
-      '<p class="fine">Model: category ratio ' + m.category_ratio + ' × growth ' + m.growth_multiplier + ' (7d ' + m.growth_pct + '%) × maturity ' + m.maturity_multiplier + ' (' + m.age_years + ' years with no token). This protocol records no token in the snapshot.</p>' +
-      '<h2>How to farm it</h2><ol>' + steps + '</ol>';
+      '<h3>How the value is worked out</h3>' +
+      '<table class="model"><tbody>' +
+      '<tr><td>Size value (TVL with diminishing returns, TVL^0.9)</td><td>' + money(m.size_value_usd) + '</td></tr>' +
+      '<tr><td>Category ratio (median market-cap/TVL of its category’s token protocols)</td><td>× ' + m.category_ratio + '</td></tr>' +
+      '<tr><td>Growth (7-day change ' + m.growth_pct + '%)</td><td>× ' + m.growth_multiplier + '</td></tr>' +
+      '<tr><td>Category momentum (median 7-day change of its category’s token protocols, ' + m.momentum_pct + '%)</td><td>× ' + m.momentum_multiplier + '</td></tr>' +
+      '<tr><td>Maturity (' + m.age_years + ' years with no token, log-scaled)</td><td>× ' + m.maturity_multiplier + '</td></tr>' +
+      '<tr><td>Chain factor (' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's') + ')</td><td>× ' + m.chain_factor + '</td></tr>' +
+      '<tr><td><strong>Implied value</strong></td><td><strong>' + money(r.implied_value_usd) + '</strong></td></tr>' +
+      '</tbody></table>' +
+      '<p class="fine">This protocol records no token in the snapshot. The implied value is this entry’s own claim, not a prediction that a token will be issued.</p>' +
+      '<h3>How to farm it</h3><ol>' + steps + '</ol>';
     detailEl.classList.remove('hidden');
     $('close-detail').addEventListener('click', function () {
       state.selected = null; detailEl.classList.add('hidden'); render();
@@ -138,6 +169,7 @@
   qEl.addEventListener('input', function () { state.q = qEl.value; render(); });
   catEl.addEventListener('change', function () { state.cat = catEl.value; render(); });
   chainEl.addEventListener('change', function () { state.chain = chainEl.value; render(); });
+  watchEl.addEventListener('change', function () { state.watchOnly = watchEl.checked; render(); });
   viewEl.addEventListener('change', function () {
     state.view = viewEl.value;
     state.selected = null; detailEl.classList.add('hidden');
