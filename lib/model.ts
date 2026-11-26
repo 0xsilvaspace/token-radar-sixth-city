@@ -1,4 +1,4 @@
-// Token launch radar, model version radar-4.
+// Token launch radar, model version radar-5.
 //
 // One sealed snapshot in, one ranked board out. The board ranks protocols that
 // record no token (no market cap, no CoinGecko id, no symbol) by an implied
@@ -6,21 +6,22 @@
 // The value is the entry's own claim, never make.fun's, and it never predicts
 // whether or when a token is issued.
 //
-// radar-4 fits its value model to the snapshot instead of hand-picking the
-// weights: at runtime it runs an ordinary least squares regression of log
-// market cap on log TVL, 7-day growth, age and chain count, over the token
-// protocols the snapshot holds, with plain standard-library math. The fit is
-// then judged on its own numbers before it is allowed to score anything:
-// it must explain at least 30% of the variation (R-squared 0.30 or better)
-// and its TVL, growth and age coefficients must all be non-negative, since a
-// launch is worth more when the protocol is bigger, growing and long-running.
-// On this snapshot the fit fails that bar: it explains only about 22% of log
-// market cap, and its growth and age coefficients come out negative, the
-// opposite of what a launch is worth (a single down week in the snapshot, and
-// older token protocols carrying lower market caps). So radar-4 scores with
-// the radar-3 category-median model and reports the regression, its
-// coefficients and its R-squared, as a diagnostic the dashboard shows. The
-// scoring model, per protocol, every input from the snapshot alone; no
+// radar-5 picks its scoring model by held-out validation instead of by a
+// single in-sample fit: at runtime it splits the snapshot's token protocols
+// into two deterministic halves (even vs odd by sorted slug), fits a
+// regression of log market cap over TVL on the fit half, and scores both
+// that regression and the radar-3 category-median model on the held-out
+// half by Spearman rank correlation between predicted and actual market
+// cap, in both directions, and the model with the better average wins. On
+// this snapshot the regression does not win: its average held-out Spearman
+// is 0.33 against radar-3's 0.34, and its held-out R-squared on log ratio
+// is negative in both directions, so the board still scores with the
+// radar-3 category-median model and the validation is reported whole, so
+// the choice is checkable from the dashboard's own data. The v3 diagnostic
+// also stays: a runtime regression of log market cap on log TVL, growth,
+// age and chain count explains only about 22% of the variation with
+// negative growth and age coefficients, so it stands as a diagnostic too.
+// The scoring model, per protocol, every input from the snapshot alone; no
 // protocol name is ever special-cased and the same functions score every row.
 //
 //   sizeValue  = TVL with diminishing returns: TVL^0.9 * $1M^0.1. A $2.75B
@@ -114,7 +115,7 @@ export const MODEL: ModelConstants = {
   implied_cap_usd: 50_000_000_000,
 };
 
-export const MODEL_VERSION = 'radar-4';
+export const MODEL_VERSION = 'radar-5';
 
 /** The bar a fitted regression must clear before it is allowed to score. */
 export const FIT_MIN_R_SQUARED = 0.3;
@@ -165,6 +166,30 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
+/**
+ * The held-out validation that picks the scoring model: the snapshot's token
+ * protocols are split into two deterministic halves (even vs odd by sorted
+ * slug), the log-ratio regression is fitted on one half and both it and the
+ * radar-3 category-median model are scored on the other half by Spearman
+ * rank correlation between predicted and actual market cap, in both
+ * directions. The model with the better average wins; a tie keeps radar-3.
+ */
+export interface ModelValidation {
+  /** Token protocols the validation ran on. */
+  n: number;
+  /** Held-out Spearman for the log-ratio regression, one per fold. */
+  regression_spearman: [number, number];
+  /** Held-out Spearman for the radar-3 category-median model, one per fold. */
+  radar3_spearman: [number, number];
+  /** Average held-out Spearman across the two folds. */
+  regression_avg: number;
+  radar3_avg: number;
+  /** Which model scored the board. */
+  winner: 'regression' | 'radar-3';
+  /** The verdict in plain words, with the numbers. */
+  reason: string;
+}
+
 /** One of the board's fastest growers over seven days. */
 export interface MoverRow {
   slug: string;
@@ -199,6 +224,19 @@ export interface RegressionFit {
   reason: string;
 }
 
+/** One category's leaders: its three highest-valued pre-token protocols. */
+export interface LeaderCategory {
+  category: string;
+  total_implied_value_usd: number;
+  rows: {
+    slug: string;
+    name: string;
+    rank: number;
+    implied_value_usd: number;
+    tvl_usd: number;
+  }[];
+}
+
 export interface RadarData {
   as_of: string;
   source: string;
@@ -208,6 +246,8 @@ export interface RadarData {
   /** Which model scored the board, and why. */
   scoring: string;
   regression: RegressionFit;
+  /** The held-out validation that picked the scoring model. */
+  validation: ModelValidation;
   watchlist_size: number;
   board_size: number;
   early_size: number;
@@ -218,6 +258,8 @@ export interface RadarData {
   live: LiveRow[];
   /** The board's ten fastest growers over seven days. */
   movers: MoverRow[];
+  /** The top 3 pre-token protocols in each of the largest categories. */
+  leaders: LeaderCategory[];
 }
 
 export class SnapshotError extends Error {
@@ -403,6 +445,197 @@ export function regressionValue(p: SnapshotProtocol, asOf: string, fit: Regressi
   return Math.min(model.implied_cap_usd, Math.max(1, Math.round(Math.exp(logValue))));
 }
 
+/**
+ * The log-ratio regression: log market cap over TVL on category dummies
+ * (categories with at least 3 token protocols in the fit set), 7-day growth,
+ * log(1+age) and log chain count. Its target strips TVL out of the price, so
+ * the fit has to earn its keep on the ratio itself instead of riding TVL.
+ */
+export interface RatioFit {
+  /** Token protocols the fit ran on. */
+  n: number;
+  /** Fitted coefficients: [intercept, one per category, growth, log(1+age), log chains]. */
+  coefficients: number[];
+  /** The categories with dummies, in coefficient order. */
+  categories: string[];
+  /** Median 7-day change of the fit set, used where a protocol reports none. */
+  median_growth_pct: number;
+  /** Median age in years of the fit set, used where a protocol reports no listed date. */
+  median_age_years: number;
+}
+
+/** One row of the log-ratio regression's design matrix. */
+export function ratioFeatures(
+  p: SnapshotProtocol,
+  cats: string[],
+  medianGrowthPct: number,
+  medianAgeYears: number,
+  asOf: string,
+): number[] {
+  const row: number[] = [1];
+  for (const c of cats) row.push(p.category === c ? 1 : 0);
+  row.push(Math.min(1.0, Math.max(-0.5, growthOf(p, medianGrowthPct))));
+  const age = ageDays(asOf, p.listed_at);
+  row.push(Math.log(1 + (age === null ? medianAgeYears : age / 365)));
+  row.push(Math.log(Math.max(1, p.chains.length)));
+  return row;
+}
+
+/** A protocol's 7-day growth as a fraction, or the fit set's median. */
+function growthOf(p: SnapshotProtocol, medianGrowthPct: number): number {
+  return (typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : medianGrowthPct) / 100;
+}
+
+/**
+ * Fit the log-ratio regression on a pool of token protocols, or null when the
+ * design matrix is singular or the pool is too small to fit. Categories with
+ * fewer than 3 protocols in the pool share the intercept instead of getting
+ * a dummy of their own.
+ */
+export function fitRatioRegression(
+  pool: SnapshotProtocol[],
+  asOf: string,
+): RatioFit | null {
+  const token = pool.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const counts = new Map<string, number>();
+  for (const p of token) {
+    const k = p.category ?? 'Uncategorised';
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  const cats = [...counts.entries()]
+    .filter(([, n]) => n >= 3)
+    .map(([c]) => c)
+    .sort();
+  const growths = token.filter((p) => typeof p.change_7d === 'number').map((p) => p.change_7d as number);
+  const ages = token.map((p) => ageDays(asOf, p.listed_at)).filter((a): a is number => a !== null).map((a) => a / 365);
+  const medianGrowthPct = median(growths) ?? 0;
+  const medianAgeYears = median(ages) ?? 1;
+  const xRows = token.map((p) => ratioFeatures(p, cats, medianGrowthPct, medianAgeYears, asOf));
+  const y = token.map((p) => Math.log((p.mcap_usd as number) / p.tvl_usd));
+  if (xRows.length <= xRows[0]!.length + 1) return null;
+  const beta = ols(xRows, y);
+  if (beta === null) return null;
+  return {
+    n: token.length,
+    coefficients: beta.map((v) => Math.round(v * 10000) / 10000),
+    categories: cats,
+    median_growth_pct: Math.round(medianGrowthPct * 100) / 100,
+    median_age_years: Math.round(medianAgeYears * 100) / 100,
+  };
+}
+
+/** What the log-ratio regression would price a protocol at, capped like every implied value. */
+export function ratioRegressionValue(
+  p: SnapshotProtocol,
+  asOf: string,
+  fit: RatioFit,
+  model: ModelConstants = MODEL,
+): number {
+  const row = ratioFeatures(p, fit.categories, fit.median_growth_pct, fit.median_age_years, asOf);
+  const logRatio = row.reduce((a, v, j) => a + v * fit.coefficients[j]!, 0);
+  return Math.min(model.implied_cap_usd, Math.max(1, Math.round(Math.exp(logRatio) * p.tvl_usd)));
+}
+
+/**
+ * The log-ratio regression's scoring of one protocol, written in the same
+ * factor form as impliedValue so the two models compare directly: the
+ * regression's log-linear terms become multipliers that multiply to the
+ * regression's prediction. Only used when the held-out validation picks it.
+ */
+export function ratioRegressionBreakdown(
+  p: SnapshotProtocol,
+  asOf: string,
+  fit: RatioFit,
+  model: ModelConstants = MODEL,
+): {
+  implied: number;
+  ratio: number;
+  size: number;
+  growthPct: number;
+  growthMult: number;
+  momentumPct: number;
+  momentumMult: number;
+  maturityMult: number;
+  chainFactor: number;
+  ageYears: number;
+  age: number | null;
+} {
+  const coeffs = fit.coefficients;
+  const nCats = fit.categories.length;
+  const intercept = coeffs[0]!;
+  const dummy = fit.categories.indexOf(p.category ?? 'Uncategorised');
+  const bGrowth = coeffs[1 + nCats]!;
+  const bAge = coeffs[2 + nCats]!;
+  const bChains = coeffs[3 + nCats]!;
+  const row = ratioFeatures(p, fit.categories, fit.median_growth_pct, fit.median_age_years, asOf);
+  const age = ageDays(asOf, p.listed_at);
+  const ageYears = age === null ? fit.median_age_years : age / 365;
+  const size = p.tvl_usd;
+  const ratio = Math.exp(intercept + (dummy >= 0 ? coeffs[1 + dummy]! : 0));
+  const growthPct = Math.round(row[1 + nCats]! * 100 * 100) / 100;
+  const growthMult = Math.exp(bGrowth * row[1 + nCats]!);
+  const maturityMult = Math.exp(bAge * row[2 + nCats]!);
+  const chainFactor = Math.exp(bChains * row[3 + nCats]!);
+  const implied = Math.min(
+    model.implied_cap_usd,
+    Math.max(1, Math.round(size * ratio * growthMult * maturityMult * chainFactor)),
+  );
+  return { implied, ratio, size, growthPct, growthMult, momentumPct: 0, momentumMult: 1, maturityMult, chainFactor, ageYears, age };
+}
+
+/**
+ * Pick the scoring model by held-out validation: split the snapshot's token
+ * protocols into two deterministic halves (even vs odd by sorted slug), fit
+ * the log-ratio regression on one half, and score both it and the radar-3
+ * category-median model on the other half by Spearman rank correlation
+ * between predicted and actual market cap, in both directions. The model
+ * with the better average wins; a tie keeps radar-3, and so does a singular
+ * fit. Both models' ratios and momentum come from the fit half alone, so
+ * the held-out half is never allowed to price itself.
+ */
+export function validateModels(snapshot: Snapshot, model: ModelConstants = MODEL): ModelValidation {
+  const token = snapshot.protocols
+    .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
+    .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const folds: [SnapshotProtocol[], SnapshotProtocol[]][] = [
+    [token.filter((_, i) => i % 2 === 0), token.filter((_, i) => i % 2 === 1)],
+    [token.filter((_, i) => i % 2 === 1), token.filter((_, i) => i % 2 === 0)],
+  ];
+  const regScores: number[] = [];
+  const r3Scores: number[] = [];
+  for (const [fitSet, testSet] of folds) {
+    const fit = fitRatioRegression(fitSet, snapshot.as_of);
+    const { records: rRec, global: rGlob } = ratiosFor(fitSet, model);
+    const { records: mRec, global: mGlob } = momentumFor(fitSet, model);
+    for (const p of testSet) {
+      const k = p.category ?? 'Uncategorised';
+      if (!(k in rRec)) rRec[k] = Math.round(Math.min(model.ratio_max, Math.max(model.ratio_min, rGlob)) * 10000) / 10000;
+      if (!(k in mRec)) mRec[k] = mGlob;
+    }
+    const actual = testSet.map((p) => p.mcap_usd as number);
+    const predReg = fit === null ? testSet.map(() => 0) : testSet.map((p) => ratioRegressionValue(p, snapshot.as_of, fit, model));
+    const predR3 = testSet.map((p) => impliedValue(p, snapshot.as_of, rRec, mRec, model).implied);
+    regScores.push(fit === null ? 0 : spearman(actual, predReg));
+    r3Scores.push(spearman(actual, predR3));
+  }
+  const regAvg = Math.round(((regScores[0]! + regScores[1]!) / 2) * 10000) / 10000;
+  const r3Avg = Math.round(((r3Scores[0]! + r3Scores[1]!) / 2) * 10000) / 10000;
+  const winner: 'regression' | 'radar-3' = regAvg > r3Avg ? 'regression' : 'radar-3';
+  const reason =
+    winner === 'regression'
+      ? `Held-out validation (two folds, Spearman on market cap): the log-ratio regression averages ${regAvg} against radar-3's ${r3Avg}, so the regression scores the board.`
+      : `Held-out validation (two folds, Spearman on market cap): the log-ratio regression averages ${regAvg} against radar-3's ${r3Avg}, so it does not beat the category-median model and the board scores with radar-3.`;
+  return {
+    n: token.length,
+    regression_spearman: [Math.round(regScores[0]! * 10000) / 10000, Math.round(regScores[1]! * 10000) / 10000],
+    radar3_spearman: [Math.round(r3Scores[0]! * 10000) / 10000, Math.round(r3Scores[1]! * 10000) / 10000],
+    regression_avg: regAvg,
+    radar3_avg: r3Avg,
+    winner,
+    reason,
+  };
+}
+
 /** Whether a protocol records no token at all in the snapshot. */
 export function isPreToken(p: SnapshotProtocol): boolean {
   return p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
@@ -417,15 +650,17 @@ export function isRankable(p: SnapshotProtocol): boolean {
 }
 
 /**
- * The market-cap-to-TVL ratio each category earns, taken from the protocols in
- * it that already have a token. Categories with too few token protocols fall
- * back to the global median. Every ratio is clamped so one outlier cannot set
- * a price for a whole category.
+ * The market-cap-to-TVL ratios of a pool of protocols, per category, with the
+ * pool's global median: the same rule categoryRatios applies to the whole
+ * snapshot, exposed so the held-out validation can run it on a fit half.
  */
-export function categoryRatios(snapshot: Snapshot, model: ModelConstants = MODEL): Record<string, number> {
+export function ratiosFor(
+  protocols: SnapshotProtocol[],
+  model: ModelConstants = MODEL,
+): { records: Record<string, number>; global: number } {
   const byCategory = new Map<string, number[]>();
   const all: number[] = [];
-  for (const p of snapshot.protocols) {
+  for (const p of protocols) {
     if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
     const r = p.mcap_usd / p.tvl_usd;
     all.push(r);
@@ -436,24 +671,36 @@ export function categoryRatios(snapshot: Snapshot, model: ModelConstants = MODEL
   }
   const global = median(all) ?? model.ratio_fallback;
   const clamp = (v: number): number => Math.min(model.ratio_max, Math.max(model.ratio_min, v));
-  const out: Record<string, number> = {};
+  const records: Record<string, number> = {};
   for (const [cat, list] of byCategory) {
     const m = list.length >= model.min_category_samples ? median(list) : null;
-    out[cat] = Math.round(clamp(m ?? global) * 10000) / 10000;
+    records[cat] = Math.round(clamp(m ?? global) * 10000) / 10000;
   }
-  return out;
+  return { records, global: Math.round(global * 10000) / 10000 };
 }
 
 /**
- * Each category's momentum: the median 7-day TVL change of the protocols in
+ * The market-cap-to-TVL ratio each category earns, taken from the protocols in
  * it that already have a token. Categories with too few token protocols fall
- * back to the median across all token protocols. Clamped so one hot week
- * cannot set a price for a whole category.
+ * back to the global median. Every ratio is clamped so one outlier cannot set
+ * a price for a whole category.
  */
-export function categoryMomentum(snapshot: Snapshot, model: ModelConstants = MODEL): Record<string, number> {
+export function categoryRatios(snapshot: Snapshot, model: ModelConstants = MODEL): Record<string, number> {
+  return ratiosFor(snapshot.protocols, model).records;
+}
+
+/**
+ * Each category's momentum from a pool of protocols, with the pool's global
+ * median: the same rule categoryMomentum applies to the whole snapshot,
+ * exposed so the held-out validation can run it on a fit half.
+ */
+export function momentumFor(
+  protocols: SnapshotProtocol[],
+  model: ModelConstants = MODEL,
+): { records: Record<string, number>; global: number } {
   const byCategory = new Map<string, number[]>();
   const all: number[] = [];
-  for (const p of snapshot.protocols) {
+  for (const p of protocols) {
     if (p.mcap_usd === null || typeof p.change_7d !== 'number' || !Number.isFinite(p.change_7d)) continue;
     all.push(p.change_7d);
     const key = p.category ?? 'Uncategorised';
@@ -463,12 +710,55 @@ export function categoryMomentum(snapshot: Snapshot, model: ModelConstants = MOD
   }
   const global = median(all) ?? 0;
   const clamp = (v: number): number => Math.min(model.momentum_cap, Math.max(model.momentum_floor, v));
-  const out: Record<string, number> = {};
+  const records: Record<string, number> = {};
   for (const [cat, list] of byCategory) {
     const m = list.length >= model.min_category_samples ? median(list) : null;
-    out[cat] = Math.round(clamp(m ?? global) * 100) / 100;
+    records[cat] = Math.round(clamp(m ?? global) * 100) / 100;
   }
-  return out;
+  return { records, global: Math.round(global * 100) / 100 };
+}
+
+/**
+ * Each category's momentum: the median 7-day TVL change of the protocols in
+ * it that already have a token. Categories with too few token protocols fall
+ * back to the median across all token protocols. Clamped so one hot week
+ * cannot set a price for a whole category.
+ */
+export function categoryMomentum(snapshot: Snapshot, model: ModelConstants = MODEL): Record<string, number> {
+  return momentumFor(snapshot.protocols, model).records;
+}
+
+/** Spearman rank correlation between two lists, with average ranks for ties. */
+export function spearman(a: number[], b: number[]): number {
+  const n = a.length;
+  if (n < 2 || n !== b.length) return 0;
+  const ranks = (values: number[]): number[] => {
+    const order = values.map((v, i) => [v, i] as [number, number]).sort((x, y) => x[0] - y[0]);
+    const r = Array<number>(n).fill(0);
+    let i = 0;
+    while (i < n) {
+      let j = i;
+      while (j + 1 < n && order[j + 1]![0] === order[i]![0]) j++;
+      const avg = (i + j) / 2 + 1;
+      for (let t = i; t <= j; t++) r[order[t]![1]] = avg;
+      i = j + 1;
+    }
+    return r;
+  };
+  const ra = ranks(a);
+  const rb = ranks(b);
+  const ma = ra.reduce((s, v) => s + v, 0) / n;
+  const mb = rb.reduce((s, v) => s + v, 0) / n;
+  let num = 0;
+  let da = 0;
+  let db = 0;
+  for (let i = 0; i < n; i++) {
+    num += (ra[i]! - ma) * (rb[i]! - mb);
+    da += (ra[i]! - ma) ** 2;
+    db += (rb[i]! - mb) ** 2;
+  }
+  if (da <= 0 || db <= 0) return 0;
+  return num / Math.sqrt(da * db);
 }
 
 /** TVL with diminishing returns, so the board is not just TVL order. */
@@ -935,6 +1225,23 @@ const RISK: Record<string, readonly string[]> = {
   ],
 };
 
+/** The core action a timeline repeats, one phrase per group. */
+const TIMELINE_CORE: Record<string, string> = {
+  lend: 'repeat the supply and borrow cycle',
+  yield: 'add liquidity or claim fees',
+  bridge: 'bridge a small amount',
+  stake: 'restake the rewards',
+  trade: 'place one small trade',
+  vault: 'top up the vault',
+  rwa: 'reinvest the yield',
+  stable: 'use the stable asset',
+  predict: 'place one market position',
+  insure: 'check the policy',
+  pay: 'make one real payment',
+  chain: 'use one of the apps',
+  deposit: 'make one qualifying action',
+};
+
 /**
  * A protocol's farm plan: five steps, six when it runs on more than one
  * chain. Every step is built from the protocol's own record (category,
@@ -979,7 +1286,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
   steps.push(
     { text: eligible, cost: 'no fee to check the tasks', time: '10 minutes' },
     {
-      text: `${weekly}, and hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`,
+      text: `${weekly}, and hold the position for at least ${hold} days so the activity is counted in more than one snapshot. Timeline: weeks 1 to 2 set up and first deposit${second === null ? '' : `, and week 2 opens the same position on ${second}`}. Weeks 3 to ${weeks}: ${TIMELINE_CORE[group] ?? TIMELINE_CORE.deposit!} once a week. Week ${weeks + 1} onwards: hold the position and watch for the points snapshot.`,
       cost: `about ${gas} of gas a week, the $${capital} stays in the position`,
       time: `${weeks} weeks, at least ${hold} days`,
     },
@@ -1017,22 +1324,26 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
   ratios: Record<string, number>;
   momentum: Record<string, number>;
   fit: RegressionFit;
+  validation: ModelValidation;
   scoring: string;
 } {
   const ratios = categoryRatios(snapshot, model);
   const momentum = categoryMomentum(snapshot, model);
   const fit = fitRegression(snapshot);
   const residuals = categoryResiduals(snapshot, fit);
-  const scoring = fit.usable
-    ? `radar-4 regression: log market cap fitted at runtime on ${fit.n} token protocols (R² ${fit.r_squared}), scoring the board`
-    : `radar-3 category-median: the runtime regression explained only ${(fit.r_squared * 100).toFixed(1)}% of log market cap (R² ${fit.r_squared} on ${fit.n} token protocols), so it stands as a diagnostic and the category-median model scores`;
-  // The scorer: the fitted regression when it cleared its bar, else the
-  // category-median model. On this snapshot the fit fails its bar, so the
-  // board scores with radar-3 and every row still carries the regression's
+  const validation = validateModels(snapshot, model);
+  const ratioFit = validation.winner === 'regression' ? fitRatioRegression(snapshot.protocols, snapshot.as_of) : null;
+  const scoring =
+    validation.winner === 'regression' && ratioFit !== null
+      ? `radar-5 log-ratio regression: held-out validation averages Spearman ${validation.regression_avg} against radar-3's ${validation.radar3_avg}, so the regression fitted on all ${ratioFit.n} token protocols scores the board`
+      : `radar-3 category-median: held-out validation averages Spearman ${validation.regression_avg} for the log-ratio regression against ${validation.radar3_avg} for the category-median model, so the regression does not beat it and the board scores with radar-3; the log-mcap regression (R² ${fit.r_squared}) stands as a diagnostic`;
+  // The scorer: the log-ratio regression when the held-out validation picks
+  // it, else the category-median model. On this snapshot the validation
+  // keeps radar-3, and every row still carries the log-mcap regression's
   // own prediction as a diagnostic.
   const score = (p: SnapshotProtocol) =>
-    fit.usable
-      ? regressionBreakdown(p, snapshot.as_of, fit, residuals, model)
+    validation.winner === 'regression' && ratioFit !== null
+      ? ratioRegressionBreakdown(p, snapshot.as_of, ratioFit, model)
       : impliedValue(p, snapshot.as_of, ratios, momentum, model);
   const bySlug = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const chosen = new Map<string, SnapshotProtocol>();
@@ -1088,7 +1399,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): {
     },
     farm_steps: farmSteps(s.p, s.v.age),
   }));
-  return { board, ratios, momentum, fit, scoring };
+  return { board, ratios, momentum, fit, validation, scoring };
 }
 
 /** The board's ten fastest growers over seven days, for the dashboard's Top movers. */
@@ -1108,9 +1419,32 @@ export function topMovers(board: BoardRow[]): MoverRow[] {
     }));
 }
 
+/** The top 3 pre-token protocols in each of the five largest categories by total implied value. */
+export function categoryLeaders(board: BoardRow[]): LeaderCategory[] {
+  const totals = new Map<string, { total: number; rows: BoardRow[] }>();
+  for (const r of board) {
+    const key = r.category ?? 'Uncategorised';
+    const entry = totals.get(key) ?? { total: 0, rows: [] };
+    entry.total += r.implied_value_usd;
+    entry.rows.push(r);
+    totals.set(key, entry);
+  }
+  return [...totals.entries()]
+    .sort((a, b) => b[1].total - a[1].total || (a[0] < b[0] ? -1 : 1))
+    .slice(0, 5)
+    .map(([category, entry]) => ({
+      category,
+      total_implied_value_usd: entry.total,
+      rows: entry.rows
+        .sort((a, b) => a.rank - b.rank)
+        .slice(0, 3)
+        .map((r) => ({ slug: r.slug, name: r.name, rank: r.rank, implied_value_usd: r.implied_value_usd, tvl_usd: r.tvl_usd })),
+    }));
+}
+
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const { board, ratios, momentum, fit, scoring } = buildBoard(snapshot, model);
+  const { board, ratios, momentum, fit, validation, scoring } = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
@@ -1121,6 +1455,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     model_version: MODEL_VERSION,
     scoring,
     regression: fit,
+    validation,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
@@ -1130,6 +1465,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     rows: board,
     live,
     movers: topMovers(board),
+    leaders: categoryLeaders(board),
   };
   return { board, radar };
 }

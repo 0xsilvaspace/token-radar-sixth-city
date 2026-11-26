@@ -1,7 +1,7 @@
-// Token Launch Radar dashboard, model radar-4: renders window.RADAR with no network.
-// Sorting, filters, watchlist-only toggle, value bars, top movers, a category
-// chart, and a detail view for every protocol with the model's factor-by-factor
-// working and the regression's own price as a check. Deep links:
+// Token Launch Radar dashboard, model radar-5: renders window.RADAR with no network.
+// Sorting, filters, watchlist-only toggle, value bars, top movers, category
+// leaders, a category chart, and a detail view for every protocol with the
+// model's factor-by-factor working and the regression's own price as a check. Deep links:
 // #detail=<slug> opens a protocol, #cat=<category> filters by category.
 
 (function () {
@@ -63,11 +63,34 @@
       ', R² ' + f.r_squared.toFixed(2) + '. ' + f.reason + ' ' + R.scoring + '.';
   })();
 
+  // The held-out validation that picked the scoring model, with its numbers.
+  (function () {
+    var v = R.validation;
+    $('validation-line').textContent = 'Checked, not assumed: the scoring model was picked by held-out validation. The ' + v.n +
+      ' token protocols were split into two halves by sorted slug; the log-ratio regression was fitted on one half and both it and the category-median model were scored on the other half by Spearman rank correlation with actual market cap. Regression ' +
+      v.regression_spearman[0].toFixed(2) + ' and ' + v.regression_spearman[1].toFixed(2) + ' across the two folds (average ' + v.regression_avg.toFixed(2) +
+      '), category-median ' + v.radar3_spearman[0].toFixed(2) + ' and ' + v.radar3_spearman[1].toFixed(2) + ' (average ' + v.radar3_avg.toFixed(2) + '). ' + v.reason;
+  })();
+
   // Top movers: the board's ten fastest growers over seven days.
   $('movers').innerHTML = R.movers.map(function (m) {
     return '<li data-slug="' + esc(m.slug) + '"><strong>#' + m.rank + ' ' + esc(m.name) + '</strong> <span class="up">' + pct(m.change_7d) + '</span> in 7 days · TVL ' + money(m.tvl_usd) + ' · implied ' + money(m.implied_value_usd) + '</li>';
   }).join('');
   $('movers').addEventListener('click', function (e) {
+    var li = e.target.closest('li[data-slug]');
+    if (!li) return;
+    location.hash = 'detail=' + li.getAttribute('data-slug');
+    showDetail(li.getAttribute('data-slug'));
+  });
+
+  // Category leaders: the top 3 pre-token protocols in each of the five largest categories.
+  $('leaders').innerHTML = R.leaders.map(function (g) {
+    var items = g.rows.map(function (r) {
+      return '<li data-slug="' + esc(r.slug) + '"><strong>#' + r.rank + ' ' + esc(r.name) + '</strong> · implied ' + money(r.implied_value_usd) + ' · TVL ' + money(r.tvl_usd) + '</li>';
+    }).join('');
+    return '<div class="leader-cat"><h3>' + esc(g.category) + ' <span class="fine">' + money(g.total_implied_value_usd) + ' total</span></h3><ol>' + items + '</ol></div>';
+  }).join('');
+  $('leaders').addEventListener('click', function (e) {
     var li = e.target.closest('li[data-slug]');
     if (!li) return;
     location.hash = 'detail=' + li.getAttribute('data-slug');

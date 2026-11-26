@@ -99,6 +99,12 @@ td.rank { font-weight: 700; color: #14532d; font-size: 16px; }
 .movers ol { margin: 8px 0 0; padding-left: 22px; }
 .movers li { margin-bottom: 7px; cursor: pointer; }
 .movers li:hover { color: #14532d; }
+.guide p { margin: 0 0 8px; max-width: 100ch; }
+#leaders { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 4px 24px; }
+.leader-cat h3 { margin: 10px 0 4px; font-size: 15px; color: #14532d; }
+.leader-cat ol { margin: 4px 0 0; padding-left: 22px; }
+.leader-cat li { margin-bottom: 6px; cursor: pointer; }
+.leader-cat li:hover { color: #14532d; }
 .cats svg { display: block; margin-top: 10px; }
 .chart-label { font-size: 12px; fill: #4c554e; font-family: inherit; }
 .chart-value { font-size: 12px; fill: #1d211d; font-weight: 600; font-family: inherit; }

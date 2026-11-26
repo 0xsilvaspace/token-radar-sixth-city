@@ -23,13 +23,27 @@
   <h2>How the ranking works</h2>
   <p id="model-text">Each protocol's implied value starts from its TVL with diminishing returns, so the board is not just TVL order: size is TVL to the power 0.9. That size is priced by its category's market-cap-to-TVL ratio, the median of the protocols in that category that already have a token (categories with fewer than 3 fall back to the global median, 0.21). Then four multipliers from the snapshot's own figures: the protocol's 7-day TVL change (clamped to -20% to +50%, weight 0.75), its category's momentum, the median 7-day change of that category's token protocols (clamped to -15% to +30%, weight 0.5), how long it has run with no token (log-scaled, 0.70 to 1.00 over 4 years), and how many chains it runs on (up to 1.15 for six or more). No protocol name is special-cased: the same formula scores every row, and every detail view shows the factor-by-factor working. Implied values are this entry's own claim, not a prediction that a token will be issued or what it will be worth. A protocol is shown as one that <strong>records no token</strong> in the snapshot, never as one that has none.</p>
   <p class="fine" id="regression-line"></p>
+  <p class="fine" id="validation-line"></p>
   <p class="fine" id="model-line"></p>
+</section>
+
+<section class="card guide">
+  <h2>How to read this board</h2>
+  <p><strong>Implied value</strong> is this entry's own claim of what a protocol's token would be worth if its record stayed as it is: its TVL, priced by what tokens in its category already earn per dollar of TVL, then adjusted by its 7-day growth, its category's momentum, how long it has run with no token, and how many chains it runs on. It is not a prediction that a token will be issued, or when, or at what price: a protocol can sit high on this board for years and never launch one.</p>
+  <p><strong>Rank</strong> is by implied value, highest first, and the bar under each value is its share of rank 1. A <span class="badge">WATCHLIST</span> badge marks the snapshot's own 40-protocol watchlist, the floor of the board; the rest are the early finds below the $50M floor. A protocol is shown as one that <strong>records no token</strong> in the snapshot, never as one that has none, because DefiLlama's record is not proof.</p>
+  <p><strong>Farm steps</strong> are the concrete moves for one protocol: what to do, what it costs in gas and capital, and how long it takes. Each plan names a capital range and a risk line, and a timeline that runs weeks 1 to 2 for setup, the middle weeks for repeating the core action, and the later weeks for holding and watching for the points snapshot. Costs are estimates from the chain's usual gas, not quotes.</p>
 </section>
 
 <section class="card movers">
   <h2>Top movers</h2>
   <p class="fine">The ten pre-token protocols on the board with the strongest 7-day TVL growth. A fast grower is not automatically the most valuable launch: growth is one multiplier in the model, and the board ranks on implied value, not on this list.</p>
   <ol id="movers"></ol>
+</section>
+
+<section class="card leaders">
+  <h2>Category leaders</h2>
+  <p class="fine">The three highest-valued pre-token protocols in each of the five largest categories by total implied value. Click one to open its detail view.</p>
+  <div id="leaders"></div>
 </section>
 
 <section class="card cats">
